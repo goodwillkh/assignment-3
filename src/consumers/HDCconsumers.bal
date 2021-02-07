@@ -1,36 +1,85 @@
+import ballerina/io;
+import ballerina/http;
 import ballerinax/kafka;
-import ballerina/graphql;
+import ballerina/log;
 import ballerina/docker;
 
-@docker:Expose {}
-listener graphql:Listener hdcListener = new(9060);
+@docker:Config{}
 
-kafka:ProducerConfiguration producerConfiguration = {
+kafka:ConsumerConfiguration consumerConfiguration = {
+
     bootstrapServers: "localhost:9092",
-    clientId: "HODProducer",
-    acks: "all",
-    retryCount: 3
+
+    groupId: "hdc-group",
+    offsetReset: "earliest",
+
+    topics: ["proposalSanction", "feeThesisAssessment"]
+
 };
 
+kafka:Consumer consumer = checkpanic new (consumerConfiguration);
+http:Client clientEndpoint = check new ("http://localhost:9060");
 
-kafka:Producer kafkaProducer = checkpanic new (producerConfiguration);
 
-@docker:Config {
-    name: "hdc",
-    tag: "v1.0"
-}
-service graphql:Service /graphql on hdcListener {
+map<json> sanctionedProposals = {};
 
-    //approve proposal
-    resource function get evaluateProposal(string studentNumber, string approved) returns string {
+public function main() {
+    while(true){
+        io:println("*********HDC*********");
 
-        string hdcEvaluation = ({studentNumber, approved}).toString();
+        extractProposal("proposalSanction");
+        io:println(sanctionedProposals);
 
-        checkpanic kafkaProducer->sendProducerRecord({
-                                    topic: "hdcEvaluation",
-                                    value: hdcEvaluation.toBytes() });
+        string applicant = io:readln("studentNumber: ");
+        string approved = io:readln("approved: ");
 
-        checkpanic kafkaProducer->flushRecords();
-        return "Proposal Evaluated";
+        var  response = clientEndpoint->post("/graphql",{ query: " { evaluateProposal(studentNumber: \""+ applicant +"\", approved: \"" + approved +"\") }" });
+        if (response is  http:Response) {
+            var jsonResponse = response.getJsonPayload();
+
+            if (jsonResponse is json) {
+                
+                io:println(jsonResponse);
+            } else {
+                io:println("Invalid payload received:", jsonResponse.message());
+            }
+
+        }
     }
 }
+
+function extractProposal(string topic){
+    kafka:ConsumerRecord[] records = checkpanic consumer->poll(1000);
+
+    foreach var kafkaRecord in records {
+        if(kafkaRecord.offset.partition.topic == topic){
+            byte[] messageContent = kafkaRecord.value;
+            string|error message = string:fromBytes(messageContent);
+
+            if (message is string) {
+                json|error jsonContent = message.fromJsonString();
+
+                if(jsonContent is json){
+                    json|error stN = jsonContent.studentNumber;
+                    json|error appr = jsonContent.approved;
+
+
+                    if(stN is json && appr is json){
+                        int|error studentNumber = int:fromString(stN.toString());
+                        string|error approved = appr.toString();
+
+                        if(studentNumber is int && approved is string ){
+                            sanctionedProposals[studentNumber.toString()] = {studentNumber, approved};
+                        }
+                    }
+                    
+                }
+
+            } else {
+                log:printError("Error occurred while converting message data",
+                    err = message);
+            }
+        }
+    }
+}
+
